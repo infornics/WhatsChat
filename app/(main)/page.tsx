@@ -1,3 +1,5 @@
+import { WhatsAppChatViewer } from "@/components/whatsapp-chat-viewer";
+
 export default function Home() {
-  return <div>Start your code here...</div>;
+  return <WhatsAppChatViewer />;
 }
