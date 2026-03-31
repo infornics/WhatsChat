@@ -7,11 +7,13 @@ import {
   type ComponentType,
   startTransition,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 
 import JSZip from "jszip";
+import type { JSZipObject } from "jszip";
 import {
   Download,
   FileArchive,
@@ -25,9 +27,9 @@ import {
 } from "lucide-react";
 
 import {
-  ChatAsset,
-  ChatMessage,
-  DateOrder,
+  type ChatAsset,
+  type ChatMessage,
+  type DateOrder,
   detectAssetKind,
   guessDateOrder,
   inferMimeType,
@@ -42,7 +44,31 @@ type ViewerState = {
   assets: ChatAsset[];
   rawChatText: string;
   dateOrder: DateOrder;
+  zip: JSZip | null;
+  zipEntries: Record<string, JSZipObject>;
+  fileSize: number;
 };
+
+type ChatRow =
+  | {
+      id: string;
+      type: "day";
+      label: string;
+    }
+  | {
+      id: string;
+      type: "system";
+      message: ChatMessage;
+    }
+  | {
+      id: string;
+      type: "message";
+      message: ChatMessage;
+      isSelf: boolean;
+      joinsPrevious: boolean;
+      breaksNext: boolean;
+      showSender: boolean;
+    };
 
 const emptyState: ViewerState = {
   chatName: "WhatsChat",
@@ -52,7 +78,13 @@ const emptyState: ViewerState = {
   assets: [],
   rawChatText: "",
   dateOrder: "DMY",
+  zip: null,
+  zipEntries: {},
+  fileSize: 0,
 };
+
+const MAX_URL_CACHE = 120;
+const VIRTUAL_OVERSCAN_PX = 1200;
 
 function formatTime(date: Date | null) {
   if (!date) {
@@ -95,18 +127,156 @@ function deriveChatName(fileName: string, txtName: string | null) {
     .trim();
 }
 
+function formatBytes(bytes: number) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function binarySearchOffset(offsets: number[], value: number) {
+  let low = 0;
+  let high = offsets.length - 1;
+  let answer = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+
+    if (offsets[mid] <= value) {
+      answer = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return answer;
+}
+
+function cleanupObjectUrls(urlMap: Map<string, string>) {
+  for (const url of urlMap.values()) {
+    URL.revokeObjectURL(url);
+  }
+
+  urlMap.clear();
+}
+
+function estimateTextLines(text: string, charsPerLine: number) {
+  if (!text) {
+    return 0;
+  }
+
+  return text.split("\n").reduce((lineCount, line) => {
+    const estimated = Math.max(1, Math.ceil(line.length / charsPerLine));
+    return lineCount + estimated;
+  }, 0);
+}
+
+function estimateRowHeight(row: ChatRow) {
+  if (row.type === "day") {
+    return 52;
+  }
+
+  if (row.type === "system") {
+    return 28 + estimateTextLines(row.message.text, 36) * 18 + 18;
+  }
+
+  const attachmentHeight =
+    row.message.attachment?.kind === "image" || row.message.attachment?.kind === "sticker"
+      ? 260
+      : row.message.attachment?.kind === "video"
+        ? 260
+        : row.message.attachment?.kind === "audio" || row.message.attachment
+          ? 90
+          : 0;
+
+  const senderHeight = row.showSender ? 18 : 0;
+  const bubblePadding = 38;
+  const textHeight = Math.max(1, estimateTextLines(row.message.text, 30)) * 22;
+
+  return bubblePadding + senderHeight + attachmentHeight + textHeight;
+}
+
+function buildChatRows(messages: ChatMessage[], selectedSelf: string | null) {
+  const rows: ChatRow[] = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const previousMessage = messages[index - 1];
+    const nextMessage = messages[index + 1];
+    const currentDay = getDayKey(message.timestamp);
+    const previousDay = previousMessage ? getDayKey(previousMessage.timestamp) : null;
+
+    if (currentDay !== previousDay) {
+      rows.push({
+        id: `day-${currentDay}-${index}`,
+        type: "day",
+        label: formatDay(message.timestamp),
+      });
+    }
+
+    if (message.isSystem) {
+      rows.push({
+        id: `system-${message.id}`,
+        type: "system",
+        message,
+      });
+      continue;
+    }
+
+    const isSelf = Boolean(selectedSelf) && message.sender === selectedSelf;
+    const joinsPrevious =
+      Boolean(previousMessage) &&
+      previousMessage?.sender === message.sender &&
+      getDayKey(previousMessage?.timestamp ?? null) === currentDay &&
+      !message.isSystem;
+    const breaksNext =
+      !nextMessage ||
+      nextMessage.sender !== message.sender ||
+      getDayKey(nextMessage.timestamp) !== currentDay ||
+      nextMessage.isSystem;
+
+    rows.push({
+      id: `message-${message.id}`,
+      type: "message",
+      message,
+      isSelf,
+      joinsPrevious,
+      breaksNext,
+      showSender: !isSelf && !joinsPrevious && Boolean(message.sender),
+    });
+  }
+
+  return rows;
+}
+
 export function WhatsAppChatViewer() {
   const [viewer, setViewer] = useState<ViewerState>(emptyState);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(0);
   const [isResizing, setIsResizing] = useState(false);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
   const layoutRef = useRef<HTMLDivElement | null>(null);
-  const objectUrlsRef = useRef<string[]>([]);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const urlCacheRef = useRef(new Map<string, string>());
+  const urlUseOrderRef = useRef<string[]>([]);
 
   useEffect(() => {
+    const urlCache = urlCacheRef.current;
+
     return () => {
-      cleanupObjectUrls(objectUrlsRef.current);
+      cleanupObjectUrls(urlCache);
     };
   }, []);
 
@@ -171,6 +341,123 @@ export function WhatsAppChatViewer() {
     };
   }, [isResizing]);
 
+  useEffect(() => {
+    function syncViewportHeight() {
+      const container = chatScrollRef.current;
+
+      if (!container) {
+        return;
+      }
+
+      setViewportHeight(container.clientHeight);
+    }
+
+    syncViewportHeight();
+
+    const container = chatScrollRef.current;
+
+    if (!container) {
+      return;
+    }
+
+    const observer = new ResizeObserver(syncViewportHeight);
+    observer.observe(container);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [viewer.messages.length]);
+
+  const rows = useMemo(() => buildChatRows(viewer.messages, viewer.selectedSelf), [
+    viewer.messages,
+    viewer.selectedSelf,
+  ]);
+
+  const virtualization = useMemo(() => {
+    const heights: number[] = [];
+    const offsets: number[] = [];
+    let runningOffset = 0;
+
+    for (const row of rows) {
+      offsets.push(runningOffset);
+      const height = estimateRowHeight(row);
+      heights.push(height);
+      runningOffset += height;
+    }
+
+    const totalHeight = runningOffset;
+    const startOffset = Math.max(0, scrollTop - VIRTUAL_OVERSCAN_PX);
+    const endOffset = scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX;
+    const startIndex = rows.length === 0 ? 0 : binarySearchOffset(offsets, startOffset);
+    let endIndex = rows.length;
+
+    for (let index = startIndex; index < rows.length; index += 1) {
+      if (offsets[index] > endOffset) {
+        endIndex = index;
+        break;
+      }
+    }
+
+    return {
+      offsets,
+      heights,
+      totalHeight,
+      startIndex,
+      endIndex,
+    };
+  }, [rows, scrollTop, viewportHeight]);
+
+  const mediaCount = viewer.assets.filter(
+    (asset) => asset.kind === "image" || asset.kind === "video" || asset.kind === "sticker",
+  ).length;
+  const layoutStyle = {
+    "--sidebar-width": `${sidebarWidth}px`,
+  } as CSSProperties;
+
+  async function resolveAssetUrl(asset: ChatAsset) {
+    const cached = urlCacheRef.current.get(asset.fullName);
+
+    if (cached) {
+      const nextOrder = urlUseOrderRef.current.filter((key) => key !== asset.fullName);
+      nextOrder.push(asset.fullName);
+      urlUseOrderRef.current = nextOrder;
+      return cached;
+    }
+
+    const entry = viewer.zipEntries[asset.fullName];
+
+    if (!entry) {
+      throw new Error(`Missing file for ${asset.fileName}`);
+    }
+
+    const blob = await entry.async("blob");
+    const url = URL.createObjectURL(
+      new Blob([blob], {
+        type: asset.mimeType,
+      }),
+    );
+
+    urlCacheRef.current.set(asset.fullName, url);
+    urlUseOrderRef.current.push(asset.fullName);
+
+    while (urlUseOrderRef.current.length > MAX_URL_CACHE) {
+      const expiredKey = urlUseOrderRef.current.shift();
+
+      if (!expiredKey) {
+        break;
+      }
+
+      const expiredUrl = urlCacheRef.current.get(expiredKey);
+
+      if (expiredUrl) {
+        URL.revokeObjectURL(expiredUrl);
+        urlCacheRef.current.delete(expiredKey);
+      }
+    }
+
+    return url;
+  }
+
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
 
@@ -178,23 +465,22 @@ export function WhatsAppChatViewer() {
       return;
     }
 
-    cleanupObjectUrls(objectUrlsRef.current);
-    objectUrlsRef.current = [];
+    cleanupObjectUrls(urlCacheRef.current);
+    urlUseOrderRef.current = [];
     setStatus("loading");
     setErrorMessage("");
+    setScrollTop(0);
 
     try {
       const imported = await parseExport(file);
-
-      objectUrlsRef.current = imported.assets.map((asset) => asset.url);
 
       startTransition(() => {
         setViewer(imported);
         setStatus("ready");
       });
     } catch (error) {
-      cleanupObjectUrls(objectUrlsRef.current);
-      objectUrlsRef.current = [];
+      cleanupObjectUrls(urlCacheRef.current);
+      urlUseOrderRef.current = [];
       setStatus("error");
       setViewer(emptyState);
       setErrorMessage(
@@ -225,13 +511,6 @@ export function WhatsAppChatViewer() {
           : parsed.participants[0] ?? null,
     }));
   }
-
-  const mediaCount = viewer.assets.filter(
-    (asset) => asset.kind === "image" || asset.kind === "video" || asset.kind === "sticker",
-  ).length;
-  const layoutStyle = {
-    "--sidebar-width": `${sidebarWidth}px`,
-  } as CSSProperties;
 
   return (
     <div className="h-dvh overflow-hidden bg-[linear-gradient(180deg,#e7f5ef_0%,#f6efe7_45%,#f8faf9_100%)]">
@@ -274,8 +553,8 @@ export function WhatsAppChatViewer() {
                     {status === "loading" ? "Parsing your export..." : "Choose export zip"}
                   </div>
                   <p className="text-sm leading-6 text-[#5d7468]">
-                    Works with WhatsApp exported chats that include `_chat.txt` plus the attached
-                    media files.
+                    Large exports are now virtualized and media loads on demand, so the reader
+                    stays responsive with much bigger chats.
                   </p>
                 </div>
               </div>
@@ -287,7 +566,7 @@ export function WhatsAppChatViewer() {
               </div>
             ) : null}
 
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-4">
               <StatCard
                 label="Messages"
                 value={viewer.messages.length.toLocaleString()}
@@ -299,6 +578,11 @@ export function WhatsAppChatViewer() {
                 icon={Smartphone}
               />
               <StatCard label="Media" value={mediaCount.toLocaleString()} icon={Download} />
+              <StatCard
+                label="Zip Size"
+                value={viewer.fileSize ? formatBytes(viewer.fileSize) : "0 B"}
+                icon={FileArchive}
+              />
             </div>
 
             {viewer.messages.length > 0 ? (
@@ -309,6 +593,9 @@ export function WhatsAppChatViewer() {
                       Conversation Setup
                     </div>
                     <div className="text-xl font-semibold text-[#173528]">{viewer.chatName}</div>
+                  </div>
+                  <div className="rounded-full bg-[#eaf8ef] px-3 py-1 text-xs font-medium text-[#21704c]">
+                    Virtualized preview active
                   </div>
                 </div>
 
@@ -357,8 +644,8 @@ export function WhatsAppChatViewer() {
             <div className="text-sm uppercase tracking-[0.18em] text-[#8fbea9]">How it works</div>
             <div className="mt-3 space-y-2 text-sm leading-6">
               <p>1. Upload the exported WhatsApp zip.</p>
-              <p>2. The app reads the chat transcript and attached files locally.</p>
-              <p>3. Pick which participant should appear as &quot;you&quot; and browse the full chat.</p>
+              <p>2. The app parses the transcript without scanning every attachment against every message.</p>
+              <p>3. Only the visible part of the chat is rendered, and media blobs load only when needed.</p>
             </div>
           </div>
         </section>
@@ -368,10 +655,7 @@ export function WhatsAppChatViewer() {
             type="button"
             aria-label="Resize panels"
             onPointerDown={() => setIsResizing(true)}
-            className={[
-              "group flex h-full w-full touch-none items-center justify-center",
-              "cursor-col-resize select-none",
-            ].join(" ")}
+            className="group flex h-full w-full touch-none cursor-col-resize select-none items-center justify-center"
           >
             <div
               className={[
@@ -407,87 +691,88 @@ export function WhatsAppChatViewer() {
               </div>
             </div>
 
-            <div className="whatschat-wallpaper relative min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5">
+            <div
+              ref={chatScrollRef}
+              onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+              className="whatschat-wallpaper relative min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5"
+            >
               {viewer.messages.length === 0 ? <EmptyPreview status={status} /> : null}
 
-              {viewer.messages.map((message, index) => {
-                const previousMessage = viewer.messages[index - 1];
-                const nextMessage = viewer.messages[index + 1];
-                const currentDay = getDayKey(message.timestamp);
-                const previousDay = previousMessage ? getDayKey(previousMessage.timestamp) : null;
-                const showDayChip = currentDay !== previousDay;
-                const isSelf =
-                  Boolean(viewer.selectedSelf) && message.sender === viewer.selectedSelf;
-                const joinsPrevious =
-                  previousMessage &&
-                  previousMessage.sender === message.sender &&
-                  getDayKey(previousMessage.timestamp) === currentDay &&
-                  !message.isSystem;
-                const breaksNext =
-                  !nextMessage ||
-                  nextMessage.sender !== message.sender ||
-                  getDayKey(nextMessage.timestamp) !== currentDay ||
-                  nextMessage.isSystem;
+              {viewer.messages.length > 0 ? (
+                <div style={{ height: virtualization.totalHeight }} className="relative">
+                  {rows
+                    .slice(virtualization.startIndex, virtualization.endIndex)
+                    .map((row, visibleIndex) => {
+                      const index = virtualization.startIndex + visibleIndex;
+                      const top = virtualization.offsets[index];
 
-                return (
-                  <div key={message.id} className="space-y-2">
-                    {showDayChip ? (
-                      <div className="my-4 flex justify-center">
-                        <div className="rounded-full bg-[#d9e5f8] px-4 py-1 text-xs font-medium text-[#36537b] shadow-sm">
-                          {formatDay(message.timestamp)}
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {message.isSystem ? <SystemMessage message={message} /> : null}
-
-                    {!message.isSystem ? (
-                      <div className={`flex ${isSelf ? "justify-end" : "justify-start"}`}>
-                        <article
-                          className={[
-                            "max-w-[85%] rounded-[1.4rem] px-3 py-2 shadow-[0_10px_24px_rgba(22,37,29,0.08)] sm:max-w-[75%]",
-                            isSelf
-                              ? "bg-[#dcf8c6] text-[#173528]"
-                              : "bg-white text-[#1d2d25]",
-                            joinsPrevious
-                              ? isSelf
-                                ? "rounded-tr-md"
-                                : "rounded-tl-md"
-                              : "",
-                            breaksNext
-                              ? isSelf
-                                ? "rounded-br-sm"
-                                : "rounded-bl-sm"
-                              : "",
-                          ].join(" ")}
+                      return (
+                        <div
+                          key={row.id}
+                          style={{ transform: `translateY(${top}px)` }}
+                          className="absolute left-0 right-0"
                         >
-                          {!isSelf && !joinsPrevious && message.sender ? (
-                            <div className="mb-1 text-xs font-semibold text-[#0f7a52]">
-                              {message.sender}
-                            </div>
-                          ) : null}
-
-                          {message.attachment ? <AttachmentPreview asset={message.attachment} /> : null}
-
-                          {message.text ? (
-                            <p className="whitespace-pre-wrap break-words text-[15px] leading-6">
-                              {message.text}
-                            </p>
-                          ) : null}
-
-                          <div className="mt-1 flex justify-end text-[11px] text-[#6f7f76]">
-                            {formatTime(message.timestamp)}
-                          </div>
-                        </article>
-                      </div>
-                    ) : null}
-                  </div>
-                );
-              })}
+                          <ChatRowRenderer row={row} resolveAssetUrl={resolveAssetUrl} />
+                        </div>
+                      );
+                    })}
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+function ChatRowRenderer({
+  row,
+  resolveAssetUrl,
+}: {
+  row: ChatRow;
+  resolveAssetUrl: (asset: ChatAsset) => Promise<string>;
+}) {
+  if (row.type === "day") {
+    return (
+      <div className="my-4 flex justify-center">
+        <div className="rounded-full bg-[#d9e5f8] px-4 py-1 text-xs font-medium text-[#36537b] shadow-sm">
+          {row.label}
+        </div>
+      </div>
+    );
+  }
+
+  if (row.type === "system") {
+    return <SystemMessage message={row.message} />;
+  }
+
+  return (
+    <div className={`space-y-2 ${row.isSelf ? "flex justify-end" : "flex justify-start"}`}>
+      <article
+        className={[
+          "max-w-[85%] rounded-[1.4rem] px-3 py-2 shadow-[0_10px_24px_rgba(22,37,29,0.08)] sm:max-w-[75%]",
+          row.isSelf ? "bg-[#dcf8c6] text-[#173528]" : "bg-white text-[#1d2d25]",
+          row.joinsPrevious ? (row.isSelf ? "rounded-tr-md" : "rounded-tl-md") : "",
+          row.breaksNext ? (row.isSelf ? "rounded-br-sm" : "rounded-bl-sm") : "",
+        ].join(" ")}
+      >
+        {row.showSender && row.message.sender ? (
+          <div className="mb-1 text-xs font-semibold text-[#0f7a52]">{row.message.sender}</div>
+        ) : null}
+
+        {row.message.attachment ? (
+          <AttachmentPreview asset={row.message.attachment} resolveAssetUrl={resolveAssetUrl} />
+        ) : null}
+
+        {row.message.text ? (
+          <p className="whitespace-pre-wrap break-words text-[15px] leading-6">{row.message.text}</p>
+        ) : null}
+
+        <div className="mt-1 flex justify-end text-[11px] text-[#6f7f76]">
+          {formatTime(row.message.timestamp)}
+        </div>
+      </article>
     </div>
   );
 }
@@ -513,7 +798,7 @@ function EmptyPreview({ status }: { status: "idle" | "loading" | "ready" | "erro
 
 function SystemMessage({ message }: { message: ChatMessage }) {
   return (
-    <div className="flex justify-center">
+    <div className="my-2 flex justify-center">
       <div className="max-w-xl rounded-2xl bg-[#fff7cf] px-4 py-2 text-center text-xs leading-5 text-[#6d6232] shadow-sm">
         {message.text}
       </div>
@@ -521,12 +806,42 @@ function SystemMessage({ message }: { message: ChatMessage }) {
   );
 }
 
-function AttachmentPreview({ asset }: { asset: ChatAsset }) {
+function AttachmentPreview({
+  asset,
+  resolveAssetUrl,
+}: {
+  asset: ChatAsset;
+  resolveAssetUrl: (asset: ChatAsset) => Promise<string>;
+}) {
+  const [assetUrl, setAssetUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    void resolveAssetUrl(asset).then((url) => {
+      if (isMounted) {
+        setAssetUrl(url);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [asset, resolveAssetUrl]);
+
+  if (!assetUrl) {
+    return (
+      <div className="mb-2 rounded-2xl bg-[#eff6f1] p-3 text-sm text-[#5e7467]">
+        Loading {asset.kind}...
+      </div>
+    );
+  }
+
   if (asset.kind === "image" || asset.kind === "sticker") {
     return (
       <div className="mb-2 overflow-hidden rounded-2xl bg-[#edf4ef]">
         <Image
-          src={asset.url}
+          src={assetUrl}
           alt={asset.fileName}
           width={1200}
           height={900}
@@ -541,7 +856,7 @@ function AttachmentPreview({ asset }: { asset: ChatAsset }) {
     return (
       <div className="mb-2 overflow-hidden rounded-2xl bg-black">
         <video controls className="max-h-80 w-full" preload="metadata">
-          <source src={asset.url} type={asset.mimeType} />
+          <source src={assetUrl} type={asset.mimeType} />
         </video>
       </div>
     );
@@ -551,7 +866,7 @@ function AttachmentPreview({ asset }: { asset: ChatAsset }) {
     return (
       <div className="mb-2 rounded-2xl bg-[#eff6f1] p-3">
         <audio controls className="w-full">
-          <source src={asset.url} type={asset.mimeType} />
+          <source src={assetUrl} type={asset.mimeType} />
         </audio>
       </div>
     );
@@ -559,7 +874,7 @@ function AttachmentPreview({ asset }: { asset: ChatAsset }) {
 
   return (
     <a
-      href={asset.url}
+      href={assetUrl}
       download={asset.fileName}
       className="mb-2 flex items-center gap-3 rounded-2xl bg-[#eff6f1] p-3 transition hover:bg-[#e6f1ea]"
     >
@@ -595,24 +910,6 @@ function StatCard({
   );
 }
 
-function formatBytes(bytes: number) {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function cleanupObjectUrls(urls: string[]) {
-  for (const url of urls) {
-    URL.revokeObjectURL(url);
-  }
-}
-
 function AssetIcon({
   kind,
   className,
@@ -638,6 +935,7 @@ function AssetIcon({
 async function parseExport(file: File): Promise<ViewerState> {
   const zip = await JSZip.loadAsync(file);
   const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+  const zipEntries = Object.fromEntries(entries.map((entry) => [entry.name, entry]));
   const textEntries = entries.filter((entry) => entry.name.toLowerCase().endsWith(".txt"));
   const chatEntry =
     textEntries.find((entry) => entry.name.toLowerCase().includes("chat")) ?? textEntries[0];
@@ -653,26 +951,19 @@ async function parseExport(file: File): Promise<ViewerState> {
   }
 
   const assetEntries = entries.filter((entry) => entry.name !== chatEntry.name);
-  const assets = await Promise.all(
-    assetEntries.map(async (entry) => {
-      const blob = await entry.async("blob");
-      const fileName = entry.name.split("/").pop() ?? entry.name;
+  const assets = assetEntries.map((entry) => {
+    const fileName = entry.name.split("/").pop() ?? entry.name;
+    const entryData = (entry as JSZipObject & { _data?: { uncompressedSize?: number } })._data;
 
-      return {
-        fullName: entry.name,
-        fileName,
-        normalizedFileName: fileName.trim().toLowerCase(),
-        url: URL.createObjectURL(
-          new Blob([blob], {
-            type: inferMimeType(fileName),
-          }),
-        ),
-        mimeType: inferMimeType(fileName),
-        kind: detectAssetKind(fileName),
-        size: blob.size,
-      } satisfies ChatAsset;
-    }),
-  );
+    return {
+      fullName: entry.name,
+      fileName,
+      normalizedFileName: fileName.trim().toLowerCase(),
+      mimeType: inferMimeType(fileName),
+      kind: detectAssetKind(fileName),
+      size: entryData?.uncompressedSize ?? 0,
+    } satisfies ChatAsset;
+  });
 
   const dateOrder = guessDateOrder(rawChatText);
   const parsed = parseChatMessages(rawChatText, assets, dateOrder);
@@ -685,5 +976,8 @@ async function parseExport(file: File): Promise<ViewerState> {
     assets,
     rawChatText,
     dateOrder,
+    zip,
+    zipEntries,
+    fileSize: file.size,
   };
 }

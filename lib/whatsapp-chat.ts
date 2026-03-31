@@ -12,7 +12,6 @@ export type ChatAsset = {
   fullName: string;
   fileName: string;
   normalizedFileName: string;
-  url: string;
   mimeType: string;
   kind: AssetKind;
   size: number;
@@ -122,9 +121,9 @@ export function inferMimeType(fileName: string) {
 }
 
 export function guessDateOrder(chatText: string): DateOrder {
-  const lines = chatText.split(/\r?\n/);
+  let checkedLines = 0;
 
-  for (const line of lines) {
+  for (const line of iterateLines(chatText.replace(/\u200e/g, ""))) {
     const header = parseMessageHeader(line);
 
     if (!header) {
@@ -143,6 +142,12 @@ export function guessDateOrder(chatText: string): DateOrder {
 
     if (second > 12) {
       return "MDY";
+    }
+
+    checkedLines += 1;
+
+    if (checkedLines >= 200) {
+      break;
     }
   }
 
@@ -167,11 +172,10 @@ export function parseChatMessages(
 }
 
 function extractRawMessages(chatText: string) {
-  const lines = chatText.replace(/\u200e/g, "").split(/\r?\n/);
   const messages: RawMessage[] = [];
   let currentMessage: RawMessage | null = null;
 
-  for (const line of lines) {
+  for (const line of iterateLines(chatText.replace(/\u200e/g, ""))) {
     const header = parseMessageHeader(line);
 
     if (header) {
@@ -270,10 +274,11 @@ function extractAttachmentName(
     return fileAttachedMatch[1];
   }
 
-  for (const [normalizedFileName, asset] of assetMap.entries()) {
-    if (text.toLowerCase().includes(normalizedFileName)) {
-      return asset.fileName;
-    }
+  const candidateMatch = text.match(/([\w\-(). ]+\.[A-Za-z0-9]{2,5})/);
+
+  if (candidateMatch) {
+    const candidate = normalizeFileName(candidateMatch[1]);
+    return assetMap.get(candidate)?.fileName ?? null;
   }
 
   return null;
@@ -331,4 +336,28 @@ function parseWhatsAppDate(
 
   const value = new Date(year, month - 1, day, hours, minutes, seconds);
   return Number.isNaN(value.getTime()) ? null : value;
+}
+
+function* iterateLines(value: string) {
+  let startIndex = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value[index];
+
+    if (current !== "\n" && current !== "\r") {
+      continue;
+    }
+
+    yield value.slice(startIndex, index);
+
+    if (current === "\r" && value[index + 1] === "\n") {
+      index += 1;
+    }
+
+    startIndex = index + 1;
+  }
+
+  if (startIndex <= value.length) {
+    yield value.slice(startIndex);
+  }
 }
