@@ -99,7 +99,7 @@ export function WhatsAppChatViewer() {
   const [viewer, setViewer] = useState<ViewerState>(emptyState);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState("");
-  const [sidebarWidth, setSidebarWidth] = useState(420);
+  const [sidebarWidth, setSidebarWidth] = useState(0);
   const [isResizing, setIsResizing] = useState(false);
   const layoutRef = useRef<HTMLDivElement | null>(null);
   const objectUrlsRef = useRef<string[]>([]);
@@ -107,6 +107,30 @@ export function WhatsAppChatViewer() {
   useEffect(() => {
     return () => {
       cleanupObjectUrls(objectUrlsRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    function syncDefaultSidebarWidth() {
+      const layout = layoutRef.current;
+
+      if (!layout) {
+        return;
+      }
+
+      const bounds = layout.getBoundingClientRect();
+      const minWidth = 320;
+      const maxWidth = Math.max(minWidth, bounds.width - 360);
+      const nextWidth = Math.min(Math.max(bounds.width * 0.4, minWidth), maxWidth);
+
+      setSidebarWidth(nextWidth);
+    }
+
+    syncDefaultSidebarWidth();
+    window.addEventListener("resize", syncDefaultSidebarWidth);
+
+    return () => {
+      window.removeEventListener("resize", syncDefaultSidebarWidth);
     };
   }, []);
 
