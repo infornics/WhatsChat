@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import {
+  type CSSProperties,
   type ChangeEvent,
   type ComponentType,
   startTransition,
@@ -98,6 +99,9 @@ export function WhatsAppChatViewer() {
   const [viewer, setViewer] = useState<ViewerState>(emptyState);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState("");
+  const [sidebarWidth, setSidebarWidth] = useState(420);
+  const [isResizing, setIsResizing] = useState(false);
+  const layoutRef = useRef<HTMLDivElement | null>(null);
   const objectUrlsRef = useRef<string[]>([]);
 
   useEffect(() => {
@@ -105,6 +109,43 @@ export function WhatsAppChatViewer() {
       cleanupObjectUrls(objectUrlsRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isResizing) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const layout = layoutRef.current;
+
+      if (!layout) {
+        return;
+      }
+
+      const bounds = layout.getBoundingClientRect();
+      const nextWidth = event.clientX - bounds.left;
+      const minWidth = 320;
+      const maxWidth = Math.max(minWidth, bounds.width - 360);
+
+      setSidebarWidth(Math.min(Math.max(nextWidth, minWidth), maxWidth));
+    }
+
+    function handlePointerUp() {
+      setIsResizing(false);
+    }
+
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isResizing]);
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -164,10 +205,17 @@ export function WhatsAppChatViewer() {
   const mediaCount = viewer.assets.filter(
     (asset) => asset.kind === "image" || asset.kind === "video" || asset.kind === "sticker",
   ).length;
+  const layoutStyle = {
+    "--sidebar-width": `${sidebarWidth}px`,
+  } as CSSProperties;
 
   return (
     <div className="h-dvh overflow-hidden bg-[linear-gradient(180deg,#e7f5ef_0%,#f6efe7_45%,#f8faf9_100%)]">
-      <div className="grid h-full w-full grid-cols-1 gap-6 overflow-hidden px-4 py-4 sm:px-6 lg:grid-cols-[minmax(360px,420px)_minmax(0,1fr)] lg:px-8 lg:py-6">
+      <div
+        ref={layoutRef}
+        style={layoutStyle}
+        className="grid h-full w-full grid-cols-1 gap-4 overflow-hidden px-4 py-4 sm:px-6 lg:[grid-template-columns:var(--sidebar-width)_14px_minmax(0,1fr)] lg:px-8 lg:py-6"
+      >
         <section className="flex h-full min-h-0 flex-col overflow-y-auto rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-[0_24px_80px_rgba(28,56,44,0.14)] backdrop-blur">
           <div className="space-y-6">
             <div className="inline-flex w-fit items-center gap-2 rounded-full bg-[#e6fff3] px-4 py-2 text-sm font-semibold text-[#0f5c3f]">
@@ -290,6 +338,38 @@ export function WhatsAppChatViewer() {
             </div>
           </div>
         </section>
+
+        <div className="relative hidden h-full lg:flex lg:items-center lg:justify-center">
+          <button
+            type="button"
+            aria-label="Resize panels"
+            onPointerDown={() => setIsResizing(true)}
+            className={[
+              "group flex h-full w-full touch-none items-center justify-center",
+              "cursor-col-resize select-none",
+            ].join(" ")}
+          >
+            <div
+              className={[
+                "h-full w-[2px] rounded-full bg-[#bfd4c8] transition",
+                "group-hover:bg-[#4a9d74]",
+                isResizing ? "bg-[#2f7d58]" : "",
+              ].join(" ")}
+            />
+            <div
+              className={[
+                "absolute flex h-12 w-4 items-center justify-center rounded-full border border-[#d4e4db] bg-white/90 shadow-sm transition",
+                "group-hover:border-[#84bc9d] group-hover:bg-[#f3fbf6]",
+                isResizing ? "border-[#4a9d74] bg-[#f3fbf6]" : "",
+              ].join(" ")}
+            >
+              <div className="flex gap-1">
+                <span className="h-4 w-[2px] rounded-full bg-[#7f978a]" />
+                <span className="h-4 w-[2px] rounded-full bg-[#7f978a]" />
+              </div>
+            </div>
+          </button>
+        </div>
 
         <section className="flex h-full min-h-0 items-stretch justify-center overflow-hidden">
           <div className="relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-[2.5rem] border border-[#cfded6] bg-[#dde5dd] shadow-[0_30px_80px_rgba(23,53,40,0.18)]">
