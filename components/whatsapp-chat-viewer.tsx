@@ -166,9 +166,9 @@ export function WhatsAppChatViewer() {
   ).length;
 
   return (
-    <div className="min-h-screen bg-[linear-gradient(180deg,#e7f5ef_0%,#f6efe7_45%,#f8faf9_100%)]">
-      <div className="mx-auto grid min-h-screen max-w-7xl gap-10 px-4 py-8 sm:px-6 lg:grid-cols-[minmax(320px,420px)_1fr] lg:px-8">
-        <section className="flex flex-col justify-between rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-[0_24px_80px_rgba(28,56,44,0.14)] backdrop-blur">
+    <div className="h-dvh overflow-hidden bg-[linear-gradient(180deg,#e7f5ef_0%,#f6efe7_45%,#f8faf9_100%)]">
+      <div className="grid h-full w-full grid-cols-1 gap-6 overflow-hidden px-4 py-4 sm:px-6 lg:grid-cols-[minmax(360px,420px)_minmax(0,1fr)] lg:px-8 lg:py-6">
+        <section className="flex h-full min-h-0 flex-col overflow-y-auto rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-[0_24px_80px_rgba(28,56,44,0.14)] backdrop-blur">
           <div className="space-y-6">
             <div className="inline-flex w-fit items-center gap-2 rounded-full bg-[#e6fff3] px-4 py-2 text-sm font-semibold text-[#0f5c3f]">
               <MessageCircleMore className="size-4" />
@@ -281,7 +281,7 @@ export function WhatsAppChatViewer() {
             ) : null}
           </div>
 
-          <div className="mt-8 rounded-[1.75rem] bg-[#173528] p-5 text-[#d6efe3]">
+          <div className="mt-6 shrink-0 rounded-[1.75rem] bg-[#173528] p-5 text-[#d6efe3]">
             <div className="text-sm uppercase tracking-[0.18em] text-[#8fbea9]">How it works</div>
             <div className="mt-3 space-y-2 text-sm leading-6">
               <p>1. Upload the exported WhatsApp zip.</p>
@@ -291,9 +291,9 @@ export function WhatsAppChatViewer() {
           </div>
         </section>
 
-        <section className="flex min-h-[720px] items-stretch justify-center">
-          <div className="relative flex w-full max-w-3xl flex-col overflow-hidden rounded-[2.5rem] border border-[#cfded6] bg-[#dde5dd] shadow-[0_30px_80px_rgba(23,53,40,0.18)]">
-            <div className="flex items-center justify-between border-b border-[#d4dfd8] bg-[#f7faf8] px-6 py-4">
+        <section className="flex h-full min-h-0 items-stretch justify-center overflow-hidden">
+          <div className="relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-[2.5rem] border border-[#cfded6] bg-[#dde5dd] shadow-[0_30px_80px_rgba(23,53,40,0.18)]">
+            <div className="shrink-0 flex items-center justify-between border-b border-[#d4dfd8] bg-[#f7faf8] px-6 py-4">
               <div>
                 <div className="text-xs uppercase tracking-[0.24em] text-[#799181]">Preview</div>
                 <div className="text-xl font-semibold text-[#173528]">{viewer.chatName}</div>
@@ -303,7 +303,7 @@ export function WhatsAppChatViewer() {
               </div>
             </div>
 
-            <div className="whatschat-wallpaper relative flex-1 overflow-y-auto px-3 py-4 sm:px-5">
+            <div className="whatschat-wallpaper relative min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5">
               {viewer.messages.length === 0 ? <EmptyPreview status={status} /> : null}
 
               {viewer.messages.map((message, index) => {
